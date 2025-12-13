@@ -1,9 +1,17 @@
 import axios from 'axios';
+import http from 'http';
+import https from 'https';
 import { config } from './config';
+
+const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
 
 // Create axios client with api_access_token in headers
 const client = axios.create({
     baseURL: config.chatwootBaseUrl,
+    timeout: 15_000,
+    httpAgent,
+    httpsAgent,
     headers: {
         'api_access_token': config.chatwootAccessToken,
         'Content-Type': 'application/json',
