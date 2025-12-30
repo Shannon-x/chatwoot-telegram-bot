@@ -11,10 +11,13 @@ async function start() {
     console.log('Database initialized.');
 
     // Start Telegram Bot
-    bot.launch().then(() => {
-        console.log('Telegram bot started.');
+    console.log('Starting Telegram bot...');
+    bot.launch({
+        dropPendingUpdates: true,  // 忽略启动前的旧消息
+    }).then(() => {
+        console.log('✅ Telegram bot started successfully (polling mode).');
     }).catch((err) => {
-        console.error('Failed to start Telegram bot:', err);
+        console.error('❌ Failed to start Telegram bot:', err);
     });
 
     // Start Express Server

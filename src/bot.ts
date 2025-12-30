@@ -1,7 +1,7 @@
 import { Telegraf } from 'telegraf';
 import { config } from './config';
 import { getMapping, getTopic, getTopicByTopicId, deleteTopic } from './database';
-import { createMessage, toggleConversationStatus } from './chatwoot';
+import { createMessage, createMessageWithAttachment, toggleConversationStatus } from './chatwoot';
 
 export const bot = new Telegraf(config.telegramToken);
 
@@ -211,6 +211,225 @@ bot.on('callback_query', async (ctx) => {
         }
         return;
     }
+});
+
+// ============ 媒体消息处理（图片、文件、视频、音频等） ============
+
+/**
+ * 下载 Telegram 文件并返回 Buffer
+ */
+async function downloadTelegramFile(fileId: string): Promise<{ buffer: Buffer; filePath: string }> {
+    const file = await bot.telegram.getFile(fileId);
+    const filePath = file.file_path;
+    if (!filePath) {
+        throw new Error('无法获取文件路径');
+    }
+
+    const fileUrl = `https://api.telegram.org/file/bot${config.telegramToken}/${filePath}`;
+    const response = await fetch(fileUrl);
+    if (!response.ok) {
+        throw new Error(`下载文件失败: ${response.status} ${response.statusText}`);
+    }
+
+    const arrayBuffer = await response.arrayBuffer();
+    return { buffer: Buffer.from(arrayBuffer), filePath };
+}
+
+/**
+ * 获取对话 ID（根据 Forum 模式或原有模式）
+ */
+function getConversationId(ctx: any): number | null {
+    const fromId = ctx.from.id.toString();
+    const isFromForum = config.telegramForumChatId && ctx.chat.id.toString() === config.telegramForumChatId;
+
+    if (isFromForum) {
+        const threadId = ctx.message?.message_thread_id;
+        if (threadId) {
+            const topicMapping = getTopicByTopicId(threadId);
+            if (topicMapping) {
+                return topicMapping.chatwoot_conversation_id;
+            }
+        }
+        return null;
+    }
+
+    // 原有模式：仅限 Admin，必须回复消息
+    if (fromId !== config.telegramAdminId) {
+        return null;
+    }
+
+    const replyTo = ctx.message?.reply_to_message;
+    if (!replyTo) {
+        return null;
+    }
+
+    const mapping = getMapping(replyTo.message_id);
+    return mapping ? mapping.chatwoot_conversation_id : null;
+}
+
+/**
+ * 处理媒体消息的通用函数
+ */
+async function handleMediaMessage(
+    ctx: any,
+    fileId: string,
+    filename: string,
+    mimeType: string | undefined,
+    caption?: string
+) {
+    const conversationId = getConversationId(ctx);
+    
+    if (!conversationId) {
+        // Forum 模式下静默忽略，原有模式下提示
+        const fromId = ctx.from.id.toString();
+        const isFromForum = config.telegramForumChatId && ctx.chat.id.toString() === config.telegramForumChatId;
+        if (!isFromForum && fromId === config.telegramAdminId && !ctx.message?.reply_to_message) {
+            await ctx.reply('请回复客户消息来发送附件。');
+        }
+        return;
+    }
+
+    try {
+        const { buffer, filePath } = await downloadTelegramFile(fileId);
+        
+        // 如果没有指定文件名，从路径中提取
+        const finalFilename = filename || filePath.split('/').pop() || `file_${Date.now()}`;
+        
+        await createMessageWithAttachment(conversationId, caption || '', {
+            buffer,
+            filename: finalFilename,
+            mimeType,
+        });
+        
+        console.log(`附件已发送到 Chatwoot (conversation: ${conversationId}, file: ${finalFilename})`);
+    } catch (error) {
+        console.error('Failed to send attachment to Chatwoot:', error);
+        await ctx.reply('发送附件到 Chatwoot 失败，请检查日志。');
+    }
+}
+
+// 处理图片消息
+// @ts-ignore - Telegraf types
+bot.on('photo', async (ctx) => {
+    // 获取最高分辨率的图片
+    const photos = ctx.message.photo;
+    const photo = photos[photos.length - 1];
+    const caption = ctx.message.caption || '';
+    
+    await handleMediaMessage(
+        ctx,
+        photo.file_id,
+        `photo_${Date.now()}.jpg`,
+        'image/jpeg',
+        caption
+    );
+});
+
+// 处理文档/文件消息
+// @ts-ignore - Telegraf types
+bot.on('document', async (ctx) => {
+    const doc = ctx.message.document;
+    const caption = ctx.message.caption || '';
+    
+    await handleMediaMessage(
+        ctx,
+        doc.file_id,
+        doc.file_name || `document_${Date.now()}`,
+        doc.mime_type,
+        caption
+    );
+});
+
+// 处理视频消息
+// @ts-ignore - Telegraf types
+bot.on('video', async (ctx) => {
+    const video = ctx.message.video;
+    const caption = ctx.message.caption || '';
+    
+    await handleMediaMessage(
+        ctx,
+        video.file_id,
+        video.file_name || `video_${Date.now()}.mp4`,
+        video.mime_type || 'video/mp4',
+        caption
+    );
+});
+
+// 处理音频消息
+// @ts-ignore - Telegraf types
+bot.on('audio', async (ctx) => {
+    const audio = ctx.message.audio;
+    const caption = ctx.message.caption || '';
+    
+    await handleMediaMessage(
+        ctx,
+        audio.file_id,
+        audio.file_name || `audio_${Date.now()}.mp3`,
+        audio.mime_type || 'audio/mpeg',
+        caption
+    );
+});
+
+// 处理语音消息
+// @ts-ignore - Telegraf types
+bot.on('voice', async (ctx) => {
+    const voice = ctx.message.voice;
+    
+    await handleMediaMessage(
+        ctx,
+        voice.file_id,
+        `voice_${Date.now()}.ogg`,
+        voice.mime_type || 'audio/ogg',
+        ''
+    );
+});
+
+// 处理视频笔记（圆形视频）
+// @ts-ignore - Telegraf types
+bot.on('video_note', async (ctx) => {
+    const videoNote = ctx.message.video_note;
+    
+    await handleMediaMessage(
+        ctx,
+        videoNote.file_id,
+        `video_note_${Date.now()}.mp4`,
+        'video/mp4',
+        ''
+    );
+});
+
+// 处理贴纸消息
+// @ts-ignore - Telegraf types
+bot.on('sticker', async (ctx) => {
+    const sticker = ctx.message.sticker;
+    
+    // 对于动画贴纸使用 webm，静态贴纸使用 webp
+    const isAnimated = sticker.is_animated || sticker.is_video;
+    const ext = isAnimated ? 'webm' : 'webp';
+    const mimeType = isAnimated ? 'video/webm' : 'image/webp';
+    
+    await handleMediaMessage(
+        ctx,
+        sticker.file_id,
+        `sticker_${Date.now()}.${ext}`,
+        mimeType,
+        sticker.emoji || ''
+    );
+});
+
+// 处理动画/GIF消息
+// @ts-ignore - Telegraf types
+bot.on('animation', async (ctx) => {
+    const animation = ctx.message.animation;
+    const caption = ctx.message.caption || '';
+    
+    await handleMediaMessage(
+        ctx,
+        animation.file_id,
+        animation.file_name || `animation_${Date.now()}.mp4`,
+        animation.mime_type || 'video/mp4',
+        caption
+    );
 });
 
 // Launch logic will be in index.ts or separate init function
