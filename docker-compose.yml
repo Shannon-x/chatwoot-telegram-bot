@@ -1,11 +1,11 @@
 services:
   bot:
-    # 使用预构建的 Docker Hub 镜像（推荐）
+    # 使用 GitHub Packages 镜像（推荐）
     # 如需从源码构建，请将下一行注释掉，并取消注释 build: .
-    # image: shanno1024/chatwoot-telegram-bot:latest
+    image: ghcr.io/shannon-x/chatwoot-telegram-bot:latest
 
     # 从源码构建（仅用于开发）
-    build: .
+    # build: .
 
     container_name: telegram-chatwoot-bot
     restart: unless-stopped

@@ -2,8 +2,7 @@
 
 <div align="center">
 
-[![Docker Hub](https://img.shields.io/docker/v/shanno1024/chatwoot-telegram-bot?label=Docker%20Hub&logo=docker)](https://hub.docker.com/r/shanno1024/chatwoot-telegram-bot)
-[![Docker Image Size](https://img.shields.io/docker/image-size/shanno1024/chatwoot-telegram-bot/latest)](https://hub.docker.com/r/shanno1024/chatwoot-telegram-bot)
+[![GitHub Container Registry](https://img.shields.io/badge/ghcr.io-shannon--x%2Fchatwoot--telegram--bot-blue?logo=github)](https://github.com/Shannon-x/chatwoot-telegram-bot/pkgs/container/chatwoot-telegram-bot)
 [![GitHub Actions](https://img.shields.io/github/actions/workflow/status/Shannon-x/chatwoot-telegram-bot/docker-build.yml?branch=main&label=Docker%20Build)](https://github.com/Shannon-x/chatwoot-telegram-bot/actions)
 [![License](https://img.shields.io/github/license/Shannon-x/chatwoot-telegram-bot)](./LICENSE)
 
@@ -33,10 +32,11 @@
   - 每个客户对话自动创建独立话题
   - 彻底解决多用户同时对话时消息混乱问题
   - 对话结束时自动关闭话题
-  - 支持手动关闭话题
+  - 每条消息附带操作按钮（标记已解决、重新打开、查看详情）
 
 - 🎯 **便捷操作**
   - 一键标记会话为"已解决"
+  - 一键重新打开已关闭的会话
   - 快速跳转到 Chatwoot 查看完整对话历史
 
 - 🤖 **AI 消息支持**
@@ -49,11 +49,11 @@
 
 - 🐳 **开箱即用**
   - Docker 一键部署
-  - 自动构建和发布到 Docker Hub
+  - 自动构建和发布到 GitHub Container Registry
 
 ## 🚀 快速开始
 
-### 方式一：使用 Docker Hub 镜像（推荐）
+### 方式一：使用 GitHub Packages 镜像（推荐）
 
 1️⃣ **创建配置文件**
 
@@ -78,11 +78,9 @@ mkdir data
 2️⃣ **创建 docker-compose.yml**
 
 ```yaml
-version: '3.8'
-
 services:
   bot:
-    image: shanno1024/chatwoot-telegram-bot:latest
+    image: ghcr.io/shannon-x/chatwoot-telegram-bot:latest
     container_name: chatwoot-telegram-bot
     restart: unless-stopped
     ports:
@@ -96,7 +94,7 @@ services:
 3️⃣ **启动服务**
 
 ```bash
-docker-compose up -d
+docker compose up -d
 ```
 
 ### 方式二：从源码构建
@@ -111,7 +109,7 @@ cp .env.example .env
 nano .env  # 编辑配置
 
 # 构建并启动
-docker-compose up -d --build
+docker compose up -d --build
 ```
 
 ## ⚙️ 配置说明
@@ -207,8 +205,10 @@ sudo systemctl reload nginx
 **使用说明：**
 - 新客户消息会自动在群组中创建话题（格式：`🗨️ 客户名 #对话ID`）
 - 在话题内直接发送消息即可回复客户（无需引用）
-- 点击 **"✅ 标记已解决"** 后，话题会自动关闭
-- 点击 **"🔒 关闭话题"** 可手动关闭话题
+- 每条消息都有操作按钮：
+  - **✅ 标记已解决** - 标记对话为已解决并自动关闭话题
+  - **🔓 重新打开** - 重新打开已关闭的对话和话题
+  - **📱 在 Chatwoot 中查看** - 跳转到 Chatwoot 查看完整对话
 
 ---
 
@@ -220,38 +220,45 @@ sudo systemctl reload nginx
 👤 张三 (zhangsan@example.com)
 💬 你好，我需要帮助
 
-[✅ 标记已解决] [在 Chatwoot 中查看]
+[✅ 标记已解决] [🔓 重新打开]
+[📱 在 Chatwoot 中查看]
 ```
 
 ### 回复客户
 
-1. 在 Telegram 中**回复**（Reply）机器人发送的消息
-2. 输入您的回复内容
-3. 消息会自动发送到 Chatwoot 并推送给客户
+**Forum 模式：** 在话题内直接发送消息即可
+
+**普通模式：** 在 Telegram 中**回复**（Reply）机器人发送的消息，输入您的回复内容
+
+消息会自动发送到 Chatwoot 并推送给客户。
 
 ### 标记会话已解决
 
-点击消息下方的 **"✅ 标记已解决"** 按钮，会话将在 Chatwoot 中被标记为已解决。
+点击消息下方的 **"✅ 标记已解决"** 按钮，会话将在 Chatwoot 中被标记为已解决，Forum 话题会自动关闭。
+
+### 重新打开会话
+
+点击 **"🔓 重新打开"** 按钮，可以重新打开已解决的会话，Forum 话题也会重新打开。
 
 ### 查看完整对话
 
-点击 **"在 Chatwoot 中查看"** 按钮，直接跳转到 Chatwoot 查看完整对话历史。
+点击 **"📱 在 Chatwoot 中查看"** 按钮，直接跳转到 Chatwoot 查看完整对话历史。
 
 ## 🔧 管理服务
 
 ```bash
 # 查看日志
-docker-compose logs -f
+docker compose logs -f
 
 # 重启服务
-docker-compose restart
+docker compose restart
 
 # 停止服务
-docker-compose down
+docker compose down
 
 # 更新到最新版本
-docker-compose pull
-docker-compose up -d
+docker compose pull
+docker compose up -d
 ```
 
 ## ❓ 常见问题
@@ -271,11 +278,11 @@ docker-compose up -d
 检查：
 - Chatwoot Webhook 配置是否正确
 - 服务器防火墙是否开放 3000 端口
-- 查看服务日志：`docker-compose logs -f`
+- 查看服务日志：`docker compose logs -f`
 
 ### 4. 如何支持多个管理员？
 
-目前仅支持单个管理员。如需多管理员支持，需要修改源码中的 `TELEGRAM_ADMIN_ID` 逻辑。
+目前仅支持单个管理员。如需多管理员支持，建议启用 Forum Topics 模式，将多个管理员添加到群组中。
 
 ### 5. 数据库文件在哪里？
 
@@ -290,6 +297,7 @@ SQLite 数据库文件位于 `./data/mappings.db`，用于存储消息映射关�
   - Express (Webhook Server)
 - **数据库**: SQLite3
 - **容器**: Docker
+- **镜像仓库**: GitHub Container Registry (ghcr.io)
 
 ## 📦 项目结构
 
@@ -312,7 +320,7 @@ chatwoot-telegram-bot/
 
 项目配置了 GitHub Actions，每次推送到 `main` 分支时会自动：
 1. 构建 Docker 镜像
-2. 推送到 Docker Hub
+2. 推送到 GitHub Container Registry (ghcr.io)
 3. 标记为 `latest`
 
 ## 🤝 贡献
