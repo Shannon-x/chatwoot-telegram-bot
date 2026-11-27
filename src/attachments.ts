@@ -37,6 +37,34 @@ function pickAttachmentUrl(att: ChatwootAttachment): string | undefined {
     return att.data_url || att.file_url || att.download_url || att.url || att.thumb_url;
 }
 
+function attachmentFilename(att: ChatwootAttachment, url: string): string {
+    if (att.file_name) return att.file_name;
+
+    const fallback = `attachment-${att.id || Date.now()}`;
+    let filename = '';
+    try {
+        // Active Storage URLs contain a signed blob ID followed by the original filename.
+        // Require both parts so a signed ID is never used as a filename.
+        const path = new URL(url, config.chatwootBaseUrl).pathname;
+        const match = path.match(/^\/rails\/active_storage\/blobs\/(?:redirect|proxy)\/[^/]+\/([^/]+)$/);
+        if (match) filename = decodeURIComponent(match[1]);
+    } catch {
+        // A malformed URL or filename falls back to a neutral name.
+    }
+
+    const basename = filename.replace(/\\/g, '/').split('/').pop() || '';
+    const safe = basename.replace(/[\x00-\x1f\x7f"]/g, '').trim();
+    const name = safe && safe !== '.' && safe !== '..' ? safe : fallback;
+    const metadataExtension = typeof att.extension === 'string' && /^[a-z0-9]{1,10}$/i.test(att.extension)
+        ? att.extension : '';
+    const suffix = metadataExtension ? `.${metadataExtension}` : (safe.match(/\.[a-z0-9]{1,10}$/i)?.[0] || '');
+    if (suffix && !name.toLowerCase().endsWith(suffix.toLowerCase())) {
+        return name.slice(0, 200 - suffix.length) + suffix;
+    }
+    return name.length > 200 && suffix
+        ? name.slice(0, 200 - suffix.length) + suffix : name.slice(0, 200);
+}
+
 function parseDataUrl(dataUrl: string): { mimeType?: string; buffer: Buffer } | null {
     const m = /^data:([^;]+);base64,(.*)$/s.exec(dataUrl);
     if (!m) return null;
@@ -53,9 +81,9 @@ function guessTelegramSendKind(att: ChatwootAttachment, mimeType?: string): 'pho
 }
 
 async function downloadAttachment(att: ChatwootAttachment): Promise<{ buffer: Buffer; mimeType?: string; filename: string; size: number; sourceUrl?: string }> {
-    const filename = att.file_name || `attachment-${att.id || Date.now()}`;
     const url = pickAttachmentUrl(att);
     if (!url) throw new Error('附件缺少可下载的 URL');
+    const filename = attachmentFilename(att, url);
 
     if (url.startsWith('data:')) {
         const parsed = parseDataUrl(url);
@@ -68,11 +96,11 @@ async function downloadAttachment(att: ChatwootAttachment): Promise<{ buffer: Bu
         return { buffer: Buffer.alloc(0), filename, size: declaredSize, sourceUrl: url };
     }
 
-    log.debug('Downloading attachment from Chatwoot', { filename, url: url.substring(0, 120) });
+    log.debug('Downloading attachment from Chatwoot', { url: url.substring(0, 120) });
     const resp = await downloadClient.get<ArrayBuffer>(url, { responseType: 'arraybuffer' });
     const buffer = Buffer.from(resp.data);
     const mimeTypeHeader = (resp.headers?.['content-type'] as string | undefined) || undefined;
-    log.debug('Attachment downloaded', { filename, sizeBytes: buffer.length });
+    log.debug('Attachment downloaded', { sizeBytes: buffer.length });
     return { buffer, mimeType: mimeTypeHeader || att.content_type, filename, size: buffer.length, sourceUrl: url };
 }
 
@@ -132,7 +160,7 @@ export async function sendAttachmentToTelegram(params: {
             sendOptions,
         );
         saveMapping(sent.message_id, conversationId, accountId, chatwootMessageId);
-        log.warn('Attachment too large for Telegram', { filename: downloaded.filename, sizeMB: Math.ceil(downloaded.size / 1024 / 1024) });
+        log.warn('Attachment too large for Telegram', { sizeMB: Math.ceil(downloaded.size / 1024 / 1024) });
         return;
     }
 
@@ -146,9 +174,9 @@ export async function sendAttachmentToTelegram(params: {
         else if (kind === 'audio') sent = await bot.telegram.sendAudio(chatId, inputFile, sendOptions);
         else sent = await bot.telegram.sendDocument(chatId, inputFile, sendOptions);
         saveMapping(sent.message_id, conversationId, accountId, chatwootMessageId);
-        log.debug('Attachment sent via download+upload', { filename: downloaded.filename, kind });
+        log.debug('Attachment sent via download+upload', { kind });
     } catch (err) {
-        log.error('Attachment send to Telegram failed', { filename: downloaded.filename, error: String(err) });
+        log.error('Attachment send to Telegram failed', { error: String(err) });
         const url = downloaded.sourceUrl || pickAttachmentUrl(att);
         const sent = await bot.telegram.sendMessage(chatId, `📎 附件发送失败：${downloaded.filename}\n${url ? `链接：${url}` : ''}`, sendOptions);
         saveMapping(sent.message_id, conversationId, accountId, chatwootMessageId);

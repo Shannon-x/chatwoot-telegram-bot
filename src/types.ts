@@ -86,6 +86,7 @@ export interface ChatwootAttachment {
     file_type?: string;
     content_type?: string;
     file_name?: string;
+    extension?: string | null;
     file_size?: number;
     size?: number;
     url?: string;
