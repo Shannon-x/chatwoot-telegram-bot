@@ -108,7 +108,9 @@ export async function closeTopicForConversation(conversationId: number): Promise
         log.info('Closed forum topic', { conversationId, topicId: topic.telegram_topic_id });
         return true;
     } catch (err) {
-        log.error('Failed to close forum topic', { conversationId, error: String(err) });
+        const error = err as { response?: { description?: string }; message?: string };
+        if (error.response?.description?.includes('TOPIC_NOT_MODIFIED') || error.message?.includes('TOPIC_NOT_MODIFIED')) return true;
+        log.error('Failed to close forum topic', { conversationId });
         return false;
     }
 }
@@ -122,7 +124,9 @@ export async function reopenTopicForConversation(conversationId: number): Promis
         log.info('Reopened forum topic', { conversationId, topicId: topic.telegram_topic_id });
         return true;
     } catch (err) {
-        log.debug('Failed to reopen forum topic (may already be open)', { conversationId, error: String(err) });
+        const error = err as { response?: { description?: string }; message?: string };
+        if (error.response?.description?.includes('TOPIC_NOT_MODIFIED') || error.message?.includes('TOPIC_NOT_MODIFIED')) return true;
+        log.error('Failed to reopen forum topic', { conversationId });
         return false;
     }
 }

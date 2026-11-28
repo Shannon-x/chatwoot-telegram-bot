@@ -22,6 +22,8 @@ export const config = {
     chatwootAccessToken: process.env.CHATWOOT_ACCESS_TOKEN || '',
     chatwootBaseUrl: (process.env.CHATWOOT_BASE_URL || 'https://app.chatwoot.com').replace(/\/+$/, ''),
     chatwootAccountId: process.env.CHATWOOT_ACCOUNT_ID || '',
+    // Optional; when configured, reconcile incoming messages from this inbox.
+    reconciliationInboxId: process.env.RECONCILIATION_INBOX_ID || '',
     chatwootWebhookSecret: process.env.CHATWOOT_WEBHOOK_SECRET || '',
     dbPath: process.env.DB_PATH || 'mappings.db',
 };

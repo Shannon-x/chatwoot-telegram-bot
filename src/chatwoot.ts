@@ -6,6 +6,7 @@ import { config } from './config';
 import { createLogger, extractAxiosError } from './logger';
 import { KeyedMutex } from './mutex';
 import type { CannedResponse, CustomAttributeDefinition, ChatwootContactDetail, ChatwootConversation } from './types';
+import { MessageRangeTooLarge } from './reconciliation';
 
 const log = createLogger('chatwoot');
 
@@ -25,6 +26,45 @@ const client = axios.create({
         'Content-Type': 'application/json',
     },
 });
+
+// The fixed base URL and no redirects keep credentials on the configured host.
+const reconciliationClient = axios.create({
+    baseURL: config.chatwootBaseUrl,
+    timeout: 15_000,
+    maxRedirects: 0,
+    maxContentLength: 20 * 1024 * 1024,
+    headers: { api_access_token: config.chatwootAccessToken },
+});
+
+export async function verifyReconciliationInbox(): Promise<unknown> {
+    const response = await reconciliationClient.get(`/api/v1/accounts/${config.chatwootAccountId}/inboxes/${config.reconciliationInboxId}`);
+    return response.data;
+}
+
+export async function listChangedConversations(updatedWithin: number): Promise<unknown> {
+    const response = await reconciliationClient.get(`/api/v1/accounts/${config.chatwootAccountId}/conversations`, {
+        params: { inbox_id: config.reconciliationInboxId, status: 'all', assignee_type: 'all', updated_within: updatedWithin },
+    });
+    return response.data;
+}
+
+export async function listConversationMessages(conversationId: number, after: number, before: number): Promise<unknown> {
+    if (!Number.isSafeInteger(conversationId) || conversationId <= 0 || !Number.isSafeInteger(after) ||
+        !Number.isSafeInteger(before) || after < 0 || before > 2147483648 || after >= before) {
+        throw new Error('Invalid reconciliation ID');
+    }
+    const maxContentLength = 20 * 1024 * 1024;
+    try {
+        const response = await reconciliationClient.get(`/api/v1/accounts/${config.chatwootAccountId}/conversations/${conversationId}/messages`, {
+            params: { after, before }, maxContentLength,
+        });
+        return response.data;
+    } catch (error) {
+        if (axios.isAxiosError(error) && error.code === 'ERR_BAD_RESPONSE' &&
+            error.message === `maxContentLength size of ${maxContentLength} exceeded`) throw new MessageRangeTooLarge();
+        throw error;
+    }
+}
 
 const uploadClient = axios.create({
     baseURL: config.chatwootBaseUrl,
