@@ -6,6 +6,9 @@ import { config } from './config';
 import { createLogger, extractAxiosError } from './logger';
 import { KeyedMutex } from './mutex';
 import type { CannedResponse, CustomAttributeDefinition, ChatwootContactDetail, ChatwootConversation } from './types';
+import { MessageRangeTooLarge } from './reconciliation';
+import crypto from 'crypto';
+import { recordOutgoingSource, setOutgoingSourceStatus, pendingOutgoingSources } from './database';
 
 const log = createLogger('chatwoot');
 
@@ -25,6 +28,53 @@ const client = axios.create({
         'Content-Type': 'application/json',
     },
 });
+
+// The fixed base URL and no redirects keep credentials on the configured host.
+const reconciliationClient = axios.create({
+    baseURL: config.chatwootBaseUrl,
+    timeout: 15_000,
+    maxRedirects: 0,
+    maxContentLength: 20 * 1024 * 1024,
+    headers: { api_access_token: config.chatwootAccessToken },
+});
+
+export async function verifyBridgeUser(): Promise<void> {
+    if (!config.chatwootBridgeUserId) return;
+    const response = await reconciliationClient.get('/api/v1/profile');
+    if (!Number.isSafeInteger(response.data?.id) || response.data.id !== Number(config.chatwootBridgeUserId)) {
+        throw new Error('Authenticated Chatwoot user does not match CHATWOOT_BRIDGE_USER_ID');
+    }
+}
+
+export async function verifyReconciliationInbox(): Promise<unknown> {
+    const response = await reconciliationClient.get(`/api/v1/accounts/${config.chatwootAccountId}/inboxes/${config.reconciliationInboxId}`);
+    return response.data;
+}
+
+export async function listChangedConversations(updatedWithin: number): Promise<unknown> {
+    const response = await reconciliationClient.get(`/api/v1/accounts/${config.chatwootAccountId}/conversations`, {
+        params: { inbox_id: config.reconciliationInboxId, status: 'all', assignee_type: 'all', updated_within: updatedWithin },
+    });
+    return response.data;
+}
+
+export async function listConversationMessages(conversationId: number, after: number, before: number): Promise<unknown> {
+    if (!Number.isSafeInteger(conversationId) || conversationId <= 0 || !Number.isSafeInteger(after) ||
+        !Number.isSafeInteger(before) || after < 0 || before > 2147483648 || after >= before) {
+        throw new Error('Invalid reconciliation ID');
+    }
+    const maxContentLength = 20 * 1024 * 1024;
+    try {
+        const response = await reconciliationClient.get(`/api/v1/accounts/${config.chatwootAccountId}/conversations/${conversationId}/messages`, {
+            params: { after, before }, maxContentLength,
+        });
+        return response.data;
+    } catch (error) {
+        if (axios.isAxiosError(error) && error.code === 'ERR_BAD_RESPONSE' &&
+            error.message === `maxContentLength size of ${maxContentLength} exceeded`) throw new MessageRangeTooLarge();
+        throw error;
+    }
+}
 
 const uploadClient = axios.create({
     baseURL: config.chatwootBaseUrl,
@@ -97,26 +147,62 @@ export function isSelfSentMessage(chatwootMessageId: number | undefined): boolea
  * 注意：mutex 只包提交动作本身（保证同会话写入顺序），不包 withRetry 重试。
  * 这样 5xx 重试期间不会阻塞同会话的后续读写。
  */
-async function postMessage(conversationId: number, body: Record<string, unknown>, label: string) {
+export class UnknownChatwootSend extends Error {}
+export type TelegramEventKey = { chatId: string; eventId: string };
+const activeOutgoing = new Set<string>();
+export function unresolvedOutgoingCount(): number {
+    return pendingOutgoingSources().filter(source => !activeOutgoing.has(source)).length;
+}
+
+function reserveSource(conversationId: number, key?: TelegramEventKey): string {
+    const source = `bridge-${crypto.randomUUID()}`;
+    const accountId = Number(config.chatwootAccountId);
+    const senderId = Number(config.chatwootBridgeUserId || 0);
+    if (!Number.isSafeInteger(accountId) || accountId <= 0 || !Number.isSafeInteger(conversationId) || conversationId <= 0) throw new Error('Invalid source scope');
+    if (!recordOutgoingSource(source, accountId, conversationId, senderId, key?.chatId ?? 'local', key?.eventId ?? source)) {
+        throw new UnknownChatwootSend('Telegram update was already processed or is pending; verify before retrying');
+    }
+    return source;
+}
+
+async function sendOnce<T extends {id?: number}>(source: string, request: () => Promise<T>): Promise<T> {
+    let value: T;
+    activeOutgoing.add(source);
+    try { value = await request(); }
+    catch (error) {
+        // Chatwoot can return a client error after an after-commit callback
+        // fails. Any HTTP failure after sending the POST is ambiguous.
+        throw new UnknownChatwootSend('Chatwoot delivery outcome unknown; verify before retrying');
+    } finally {
+        activeOutgoing.delete(source);
+    }
+    if (!Number.isSafeInteger(value?.id) || !value.id || value.id <= 0) {
+        throw new UnknownChatwootSend('Chatwoot response missing message ID; verify before retrying');
+    }
+    try { setOutgoingSourceStatus(source, 'confirmed'); }
+    catch { throw new UnknownChatwootSend('Chatwoot delivery outcome unknown; verify before retrying'); }
+    return value;
+}
+
+async function postMessage(conversationId: number, body: Record<string, unknown>, source: string) {
     const accountId = config.chatwootAccountId;
     const url = `/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`;
-    const data = await withRetry(async () => {
-        const response = await client.post(url, body);
+    const data = await sendOnce(source, async () => {
+        const response = await client.post(url, {
+            ...body, content_attributes: { telegram_bridge_origin_token: source },
+        });
+        if (![200, 201].includes(response.status)) throw new Error('Unexpected Chatwoot response status');
         return response.data;
-    }, label);
+    });
     if (data?.id) trackSentMessage(data.id);
     return data;
 }
 
-export async function createMessage(conversationId: number, content: string) {
-    log.debug('Creating message in Chatwoot', {
-        conversationId,
-        contentPreview: content.substring(0, 100) + (content.length > 100 ? '...' : ''),
+export async function createMessage(conversationId: number, content: string, key?: TelegramEventKey) {
+    const result = await conversationMutex.runExclusive(`conv_${conversationId}`, () => {
+        const source = reserveSource(conversationId, key);
+        return postMessage(conversationId, { content, message_type: 'outgoing', private: false }, source);
     });
-
-    const result = await conversationMutex.runExclusive(`conv_${conversationId}`, () =>
-        postMessage(conversationId, { content, message_type: 'outgoing', private: false }, `createMessage(conv=${conversationId})`)
-    );
 
     log.info('Message created in Chatwoot', { conversationId, chatwootMessageId: result?.id });
     // 发送成功后主动关闭输入状态，避免后台一直显示"客服正在输入"
@@ -127,9 +213,10 @@ export async function createMessage(conversationId: number, content: string) {
 export async function createPrivateNote(conversationId: number, content: string) {
     log.debug('Creating private note in Chatwoot', { conversationId });
 
-    const result = await conversationMutex.runExclusive(`conv_${conversationId}`, () =>
-        postMessage(conversationId, { content, message_type: 'outgoing', private: true }, `createPrivateNote(conv=${conversationId})`)
-    );
+    const result = await conversationMutex.runExclusive(`conv_${conversationId}`, () => {
+        const source = reserveSource(conversationId);
+        return postMessage(conversationId, { content, message_type: 'outgoing', private: true }, source);
+    });
 
     log.info('Private note created in Chatwoot', { conversationId, chatwootMessageId: result?.id });
     return result;
@@ -138,7 +225,7 @@ export async function createPrivateNote(conversationId: number, content: string)
 export async function createMessageWithAttachment(
     conversationId: number,
     content: string,
-    attachment: { buffer: Buffer; filename: string; mimeType?: string }
+    attachment: { buffer: Buffer; filename: string; mimeType?: string }, key?: TelegramEventKey
 ) {
     log.debug('Creating message with attachment in Chatwoot', {
         conversationId,
@@ -151,12 +238,14 @@ export async function createMessageWithAttachment(
         const accountId = config.chatwootAccountId;
         const url = `/api/v1/accounts/${accountId}/conversations/${conversationId}/messages`;
 
-        const data = await withRetry(async () => {
+        const source = reserveSource(conversationId, key);
+        const data = await sendOnce(source, async () => {
             // FormData 必须每次重建：内部流不可重放，重试时复用会导致 0 字节请求
             const formData = new FormData();
             formData.append('content', content || '');
             formData.append('message_type', 'outgoing');
             formData.append('private', 'false');
+            formData.append('content_attributes', JSON.stringify({telegram_bridge_origin_token: source}));
             formData.append('attachments[]', attachment.buffer, {
                 filename: attachment.filename,
                 contentType: attachment.mimeType || 'application/octet-stream',
@@ -167,8 +256,9 @@ export async function createMessageWithAttachment(
                     'api_access_token': config.chatwootAccessToken,
                 },
             });
+            if (![200, 201].includes(response.status)) throw new Error('Unexpected Chatwoot response status');
             return response.data;
-        }, `createMessageWithAttachment(conv=${conversationId})`);
+        });
 
         if (data?.id) trackSentMessage(data.id);
         return data;

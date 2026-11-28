@@ -22,7 +22,11 @@ export const config = {
     chatwootAccessToken: process.env.CHATWOOT_ACCESS_TOKEN || '',
     chatwootBaseUrl: (process.env.CHATWOOT_BASE_URL || 'https://app.chatwoot.com').replace(/\/+$/, ''),
     chatwootAccountId: process.env.CHATWOOT_ACCOUNT_ID || '',
+    chatwootBridgeUserId: process.env.CHATWOOT_BRIDGE_USER_ID || '',
+    // Optional; when configured, reconcile incoming messages from this inbox.
+    reconciliationInboxId: process.env.RECONCILIATION_INBOX_ID || '',
     chatwootWebhookSecret: process.env.CHATWOOT_WEBHOOK_SECRET || '',
+    attachmentDownloadOrigins: (process.env.ATTACHMENT_DOWNLOAD_ORIGINS || '').split(',').map(value => value.trim()).filter(Boolean),
     dbPath: process.env.DB_PATH || 'mappings.db',
 };
 
@@ -34,6 +38,12 @@ const required: Array<[string, string]> = [
 ];
 
 const missing = required.filter(([, v]) => !v).map(([k]) => k);
+if (config.chatwootBridgeUserId && (!/^[1-9]\d*$/.test(config.chatwootBridgeUserId) || !config.chatwootWebhookSecret)) {
+    throw new Error('CHATWOOT_BRIDGE_USER_ID requires a positive ID and CHATWOOT_WEBHOOK_SECRET');
+}
+if (config.reconciliationInboxId && !config.chatwootBridgeUserId) {
+    throw new Error('Recovery requires CHATWOOT_BRIDGE_USER_ID for the dedicated bridge user');
+}
 if (missing.length > 0) {
     log.error(`Missing required environment variables: ${missing.join(', ')}`);
     process.exit(1);

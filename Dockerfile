@@ -20,6 +20,7 @@ RUN npm ci --omit=dev
 
 # Copy built artifacts
 COPY --from=builder /app/dist ./dist
+COPY scripts/resolve-recovery.cjs ./scripts/resolve-recovery.cjs
 
 # Create a data directory for the sqlite db
 RUN mkdir -p /app/data

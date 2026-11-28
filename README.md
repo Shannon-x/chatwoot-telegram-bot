@@ -18,6 +18,8 @@
 
 这是一个连接 **Chatwoot** 和 **Telegram** 的中间件机器人。通过 Telegram Bot 直接接收和回复 Chatwoot 中的客户消息，让客服团队可以在 Telegram 中高效处理客户咨询，无需时刻盯着 Chatwoot 后台网页。
 
+For opt-in message recovery, required settings, backup precautions, attachment origin compatibility and manual resolution of uncertain deliveries, read [RECONCILIATION.md](./RECONCILIATION.md) before upgrading or enabling recovery.
+
 ## ✨ 最新功能特性
 
 - 🔄 **双向消息同步**：Chatwoot 客户消息实时推送到 Telegram，Telegram 回复自动同步到 Chatwoot。
@@ -27,7 +29,7 @@
 - 🛡️ **安全与稳定性增强**：
   - **Webhook 签名验证**：确保消息来源绝对安全。
   - **消息去重机制**：防止网络波动导致的消息重复发送。
-  - **API 指数退避重试**：网络不稳定时自动重试，提升送达率。
+  - **API 指数退避重试**：可安全重试的请求采用退避；创建消息的未知结果需要人工确认。
   - **防消息死循环**：智能识别并过滤机器人自己发送的消息。
 - 🎯 **便捷操作按钮**：一键标记会话为"已解决"、一键重新打开、快速跳转 Chatwoot 后台。
 - ⌨️ **输入状态同步**：在 Telegram 中打字时，Chatwoot 网页端会实时显示“客服正在输入...”。

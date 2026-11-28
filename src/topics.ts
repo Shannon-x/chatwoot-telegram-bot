@@ -1,7 +1,8 @@
 import type { InlineKeyboardButton } from 'telegraf/types';
 import { bot } from './bot-instance';
 import { config } from './config';
-import { saveTopic, getTopic, deleteTopic } from './database';
+import { saveTopic, getTopic, deleteTopic, recordQueuedTopic, clearQueuedSend } from './database';
+import { isTelegramRejection } from './delivery-safety';
 import { createLogger } from './logger';
 import { renderContactCard } from './formatters';
 import { getCustomAttributeDefinitions } from './chatwoot';
@@ -47,6 +48,7 @@ export async function getOrCreateTopic(
     conversationId: number,
     accountId: number,
     contactInfo: ContactCardInfo,
+    queuedId?: number,
 ): Promise<number | undefined> {
     if (!config.telegramForumChatId) return undefined;
 
@@ -60,12 +62,14 @@ export async function getOrCreateTopic(
         const topicName = `🗨️ ${contactInfo.name} #${conversationId}`;
         const result = await bot.telegram.createForumTopic(config.telegramForumChatId, topicName);
         const topicId = result.message_thread_id;
-        saveTopic(conversationId, accountId, topicId, topicName);
+        if (queuedId === undefined) saveTopic(conversationId, accountId, topicId, topicName);
+        else recordQueuedTopic(queuedId, conversationId, accountId, topicId, topicName);
         log.info('Created forum topic', { topicName, topicId, conversationId });
         await sendContactCard(conversationId, accountId, topicId, contactInfo);
         return topicId;
     } catch (err) {
-        log.error('Failed to create forum topic', { conversationId, error: String(err) });
+        if (queuedId !== undefined && isTelegramRejection(err)) clearQueuedSend(queuedId);
+        log.error('Failed to create forum topic', { conversationId });
         return undefined;
     }
 }
@@ -108,7 +112,9 @@ export async function closeTopicForConversation(conversationId: number): Promise
         log.info('Closed forum topic', { conversationId, topicId: topic.telegram_topic_id });
         return true;
     } catch (err) {
-        log.error('Failed to close forum topic', { conversationId, error: String(err) });
+        const error = err as { response?: { description?: string }; message?: string };
+        if (error.response?.description?.includes('TOPIC_NOT_MODIFIED') || error.message?.includes('TOPIC_NOT_MODIFIED')) return true;
+        log.error('Failed to close forum topic', { conversationId });
         return false;
     }
 }
@@ -122,7 +128,9 @@ export async function reopenTopicForConversation(conversationId: number): Promis
         log.info('Reopened forum topic', { conversationId, topicId: topic.telegram_topic_id });
         return true;
     } catch (err) {
-        log.debug('Failed to reopen forum topic (may already be open)', { conversationId, error: String(err) });
+        const error = err as { response?: { description?: string }; message?: string };
+        if (error.response?.description?.includes('TOPIC_NOT_MODIFIED') || error.message?.includes('TOPIC_NOT_MODIFIED')) return true;
+        log.error('Failed to reopen forum topic', { conversationId });
         return false;
     }
 }
