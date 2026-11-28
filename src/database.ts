@@ -1,11 +1,13 @@
 import Database from 'better-sqlite3';
 import { config } from './config';
 import { createLogger } from './logger';
+import { acquireOwnership } from './ownership-lock';
 
 const log = createLogger('database');
 const db = new Database(config.dbPath);
+let releaseOwnership: (() => void) | undefined;
 
-const CURRENT_DB_VERSION = 7;
+const CURRENT_DB_VERSION = 8;
 
 let insertMappingStmt: Database.Statement;
 let selectMappingStmt: Database.Statement;
@@ -103,6 +105,16 @@ function migrateToVersion7(): void {
              ALTER TABLE reconciliation_state ADD COLUMN inbox_id INTEGER;`);
 }
 
+function migrateToVersion8(): void {
+    db.exec(`ALTER TABLE webhook_queue ADD COLUMN inflight TEXT;
+    CREATE TABLE bridge_outgoing_sources (
+      source_id TEXT PRIMARY KEY, account_id INTEGER NOT NULL, conversation_id INTEGER NOT NULL,
+      sender_id INTEGER NOT NULL, telegram_chat_id TEXT NOT NULL, telegram_message_id TEXT NOT NULL,
+      status TEXT NOT NULL DEFAULT 'pending' CHECK(status IN ('pending','confirmed','rejected')),
+      created_at INTEGER NOT NULL, UNIQUE(telegram_chat_id, telegram_message_id)
+    );`);
+}
+
 export function reconciliationState(nowSeconds: number, accountId: number, inboxId: number): { baseline: number; checkpoint: number } {
     if (!Number.isSafeInteger(accountId) || accountId <= 0 || !Number.isSafeInteger(inboxId) || inboxId <= 0) {
         throw new Error('Invalid reconciliation source');
@@ -171,6 +183,10 @@ function runMigrations(currentVersion: number): void {
             migrateToVersion7();
             setDatabaseVersion(7);
         }
+        if (currentVersion < 8) {
+            migrateToVersion8();
+            setDatabaseVersion(8);
+        }
     });
 
     try {
@@ -198,6 +214,10 @@ function initPreparedStatements(): void {
 
 export function initDb() {
     log.info('Initializing database...');
+
+    // Opening the target above creates a first-run DB before canonicalization.
+    // No migration or worker access is allowed without exclusive ownership.
+    releaseOwnership = acquireOwnership(config.dbPath);
 
     db.pragma('journal_mode = WAL');
     // A successful webhook response must not precede a durable SQLite commit.
@@ -277,7 +297,7 @@ export function enqueueWebhook(eventKey: string, conversationId: number, payload
 export function nextQueuedWebhook(now = Date.now()): QueuedWebhook | undefined {
     // Do not allow a later event for the same conversation to pass a failed one.
     return db.prepare(`SELECT q.id, q.conversation_id, q.payload, q.attempts, q.text_sent, q.text_chunk_index, q.attachment_index
-        FROM webhook_queue q WHERE q.state = 'pending' AND q.next_attempt_at <= ?
+        FROM webhook_queue q WHERE q.state = 'pending' AND q.inflight IS NULL AND q.next_attempt_at <= ?
         AND NOT EXISTS (SELECT 1 FROM webhook_queue older WHERE older.state = 'pending'
             AND older.conversation_id = q.conversation_id AND older.id < q.id)
         ORDER BY q.id LIMIT 1`).get(now) as QueuedWebhook | undefined;
@@ -303,12 +323,62 @@ export function recordQueuedTextChunkSent(id: number, nextIndex: number, telegra
     conversationId: number, accountId: number, chatwootMessageId?: number): void {
     db.transaction(() => {
         insertMappingStmt.run(telegramMessageId, conversationId, accountId, chatwootMessageId);
-        db.prepare(`UPDATE webhook_queue SET text_chunk_index = ? WHERE id = ? AND state = 'pending'`).run(nextIndex, id);
+        const r = db.prepare(`UPDATE webhook_queue SET text_chunk_index = ?, inflight = NULL WHERE id = ? AND state = 'pending'`).run(nextIndex, id);
+        if (r.changes !== 1) throw new Error('Pending queue item not found');
     })();
 }
 
 export function markQueuedAttachmentSent(id: number, nextIndex: number): void {
     db.prepare(`UPDATE webhook_queue SET attachment_index = ? WHERE id = ? AND state = 'pending'`).run(nextIndex, id);
+}
+
+// The returned Telegram message ID and the queue checkpoint must be committed
+// together. A failure rolls back both, preserving the original pending item.
+export function recordQueuedAttachmentSent(id: number, nextIndex: number, telegramMessageId: number,
+    conversationId: number, accountId: number, chatwootMessageId?: number): void {
+    db.transaction(() => {
+        insertMappingStmt.run(telegramMessageId, conversationId, accountId, chatwootMessageId);
+        const result = db.prepare(`UPDATE webhook_queue SET attachment_index = ?, inflight = NULL WHERE id = ? AND state = 'pending'`).run(nextIndex, id);
+        if (result.changes !== 1) throw new Error('Pending queue item not found');
+    })();
+}
+
+export function beginQueuedSend(id: number, kind: string): void {
+    const r = db.prepare(`UPDATE webhook_queue SET inflight = ? WHERE id = ? AND state = 'pending' AND inflight IS NULL`).run(kind, id);
+    if (r.changes !== 1) throw new Error('Queue operation already in flight');
+}
+
+export function clearQueuedSend(id: number): void {
+    db.prepare(`UPDATE webhook_queue SET inflight = NULL WHERE id = ? AND state = 'pending'`).run(id);
+}
+
+export function recordQueuedTopic(id: number, conversationId: number, accountId: number, topicId: number, name: string): void {
+    db.transaction(() => {
+        insertTopicStmt.run(conversationId, accountId, topicId, name);
+        const r = db.prepare(`UPDATE webhook_queue SET inflight = NULL WHERE id = ? AND state = 'pending'`).run(id);
+        if (r.changes !== 1) throw new Error('Pending queue item not found');
+    })();
+}
+
+export function recordOutgoingSource(sourceId: string, accountId: number, conversationId: number, senderId: number,
+    telegramChatId: string, telegramMessageId: string): boolean {
+    const r = db.prepare(`INSERT INTO bridge_outgoing_sources(source_id,account_id,conversation_id,sender_id,telegram_chat_id,telegram_message_id,created_at)
+        VALUES(?,?,?,?,?,?,?) ON CONFLICT(telegram_chat_id,telegram_message_id) DO NOTHING`)
+        .run(sourceId, accountId, conversationId, senderId, telegramChatId, telegramMessageId, Date.now());
+    return r.changes === 1;
+}
+
+export function setOutgoingSourceStatus(sourceId: string, status: 'confirmed' | 'rejected'): void {
+    db.prepare(`UPDATE bridge_outgoing_sources SET status = ? WHERE source_id = ?`).run(status, sourceId);
+}
+
+export function matchesOutgoingSource(sourceId: string, accountId: number, conversationId: number, senderId: number): boolean {
+    return !!db.prepare(`SELECT 1 FROM bridge_outgoing_sources WHERE source_id=? AND account_id=? AND conversation_id=? AND sender_id=?`)
+        .get(sourceId, accountId, conversationId, senderId);
+}
+
+export function pendingOutgoingSources(): string[] {
+    return (db.prepare(`SELECT source_id FROM bridge_outgoing_sources WHERE status = 'pending'`).all() as {source_id: string}[]).map(row => row.source_id);
 }
 
 export function retryQueuedWebhook(id: number, attempts: number): void {
@@ -317,10 +387,10 @@ export function retryQueuedWebhook(id: number, attempts: number): void {
         .run(Date.now() + delay, id);
 }
 
-export function webhookQueueHealth(): { pending: number; failed: number } {
+export function webhookQueueHealth(activeId?: number): { pending: number; failed: number } {
     const result = db.prepare(`SELECT COUNT(*) AS pending,
-        COALESCE(SUM(CASE WHEN attempts > 0 THEN 1 ELSE 0 END), 0) AS failed
-        FROM webhook_queue WHERE state = 'pending'`).get() as { pending: number; failed: number };
+        COALESCE(SUM(CASE WHEN attempts > 0 OR (inflight IS NOT NULL AND id != ?) THEN 1 ELSE 0 END), 0) AS failed
+        FROM webhook_queue WHERE state = 'pending'`).get(activeId ?? 0) as { pending: number; failed: number };
     return result;
 }
 
@@ -333,5 +403,8 @@ export function closeDb() {
         log.info('Database closed');
     } catch (err) {
         log.warn('Failed to close database', { error: String(err) });
+    } finally {
+        releaseOwnership?.();
+        releaseOwnership = undefined;
     }
 }

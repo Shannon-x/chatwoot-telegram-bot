@@ -37,6 +37,14 @@ test('committed queue survives restart, deduplicates and preserves each conversa
     inspect.exec('DROP TRIGGER fail_progress');
     store.recordQueuedTextChunkSent(first.id, 1, 99, 7, 1, 10);
     assert.equal(inspect.prepare('SELECT chatwoot_message_id FROM messages WHERE telegram_message_id = 99').get().chatwoot_message_id, 10);
+    store.beginQueuedSend(first.id, 'attachment:0');
+    inspect.exec(`CREATE TRIGGER fail_attachment BEFORE UPDATE OF attachment_index ON webhook_queue BEGIN SELECT RAISE(ABORT, 'test'); END`);
+    assert.throws(() => store.recordQueuedAttachmentSent(first.id, 1, 100, 7, 1, 10));
+    assert.equal(inspect.prepare('SELECT COUNT(*) AS count FROM messages WHERE telegram_message_id=100').get().count,0);
+    assert.equal(inspect.prepare('SELECT inflight FROM webhook_queue WHERE id=?').get(first.id).inflight,'attachment:0');
+    inspect.exec('DROP TRIGGER fail_attachment');
+    store.recordQueuedAttachmentSent(first.id, 1, 100, 7, 1, 10);
+    assert.deepEqual(inspect.prepare('SELECT attachment_index,inflight FROM webhook_queue WHERE id=?').get(first.id),{attachment_index:1,inflight:null});
     inspect.close();
     store.markQueuedTextSent(first.id);
     store.markQueuedTextChunkSent(first.id, 3);

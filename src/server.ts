@@ -3,9 +3,9 @@ import express from 'express';
 import type { Request, Response, NextFunction } from 'express';
 import { config } from './config';
 import { bot } from './bot-instance';
-import { getTopic, enqueueWebhook, nextQueuedWebhook, completeQueuedWebhook, retryQueuedWebhook, webhookQueueHealth, markQueuedTextSent, recordQueuedTextChunkSent, markQueuedAttachmentSent } from './database';
+import { getTopic, enqueueWebhook, nextQueuedWebhook, completeQueuedWebhook, retryQueuedWebhook, webhookQueueHealth, markQueuedTextSent, recordQueuedTextChunkSent, recordQueuedAttachmentSent, beginQueuedSend, clearQueuedSend, matchesOutgoingSource } from './database';
 import type { QueuedWebhook } from './database';
-import { isSelfSentMessage, conversationMutex } from './chatwoot';
+import { isSelfSentMessage, conversationMutex, unresolvedOutgoingCount } from './chatwoot';
 import { createLogger } from './logger';
 import { renderForwardedMessage, extractContactCard, extractSenderName } from './formatters';
 import { extractAttachments, sendAttachmentToTelegram } from './attachments';
@@ -20,6 +20,7 @@ import {
 import type { ChatwootMessageEvent, ChatwootConversationStatusEvent } from './types';
 import { splitPlainText } from './telegram-chunks';
 import { isReconciliationFailed } from './reconciliation';
+import { isTelegramRejection } from './delivery-safety';
 
 const log = createLogger('server');
 
@@ -104,6 +105,11 @@ async function handleMessageCreated(event: ChatwootMessageEvent, item: QueuedWeb
         return;
     }
 
+    if (messageType === 'outgoing' && config.chatwootWebhookSecret && config.chatwootBridgeUserId &&
+        typeof event.content_attributes?.telegram_bridge_origin_token === 'string' && event.account?.id === Number(config.chatwootAccountId) &&
+        event.sender?.id === Number(config.chatwootBridgeUserId) && event.conversation?.id &&
+        matchesOutgoingSource(event.content_attributes.telegram_bridge_origin_token, event.account.id, event.conversation.id, event.sender.id)) return;
+
     const conversationId = event?.conversation?.id;
     const accountId = event?.account?.id;
     if (!conversationId || !accountId) {
@@ -123,7 +129,9 @@ async function handleMessageCreated(event: ChatwootMessageEvent, item: QueuedWeb
         chatwootMessageId: event?.id,
     });
 
-    const topicId = await getOrCreateTopic(conversationId, accountId, contactCard);
+    const newTopic = !!config.telegramForumChatId && !getTopic(conversationId);
+    if (newTopic) beginQueuedSend(item.id, 'topic');
+    const topicId = await getOrCreateTopic(conversationId, accountId, contactCard, newTopic ? item.id : undefined);
     if (config.telegramForumChatId && !topicId) {
         throw new Error('Cannot obtain Telegram topic');
     }
@@ -156,7 +164,10 @@ async function handleMessageCreated(event: ChatwootMessageEvent, item: QueuedWeb
     const deliverRemaining = async () => {
         if (!item.text_sent) {
             for (let i = item.text_chunk_index ?? 0; i < chunks.length; i++) {
-                const sentMessage = await bot.telegram.sendMessage(chatId, chunks[i], sendOptions);
+                beginQueuedSend(item.id, `text:${i}`);
+                let sentMessage;
+                try { sentMessage = await bot.telegram.sendMessage(chatId, chunks[i], sendOptions); }
+                catch (error) { if (isTelegramRejection(error)) clearQueuedSend(item.id); throw error; }
                 recordQueuedTextChunkSent(item.id, i + 1, sentMessage.message_id, conversationId, accountId, event?.id);
                 item.text_chunk_index = i + 1;
             }
@@ -165,8 +176,10 @@ async function handleMessageCreated(event: ChatwootMessageEvent, item: QueuedWeb
         }
         for (let i = item.attachment_index; i < attachments.length; i++) {
             await sendAttachmentToTelegram({ chatId, att: attachments[i], conversationId, accountId,
-                chatwootMessageId: event?.id, messageThreadId: topicId });
-            markQueuedAttachmentSent(item.id, i + 1);
+                chatwootMessageId: event?.id, messageThreadId: topicId,
+                beginSend: () => beginQueuedSend(item.id, `attachment:${i}`),
+                clearSend: () => clearQueuedSend(item.id),
+                recordSent: id => recordQueuedAttachmentSent(item.id, i + 1, id, conversationId, accountId, event?.id) });
             item.attachment_index = i + 1;
         }
     };
@@ -175,7 +188,7 @@ async function handleMessageCreated(event: ChatwootMessageEvent, item: QueuedWeb
         await deliverRemaining();
     } catch (error: unknown) {
         const errObj = error as { response?: { description?: string }; message?: string };
-        if (errObj?.response?.description?.includes('TOPIC_CLOSED') || errObj?.message?.includes('TOPIC_CLOSED')) {
+        if (isTelegramRejection(error) && errObj?.response?.description?.includes('TOPIC_CLOSED')) {
             // Reopen the same mapped topic. A later queued open event can then
             // be acknowledged as a no-op if Telegram reports NOT_MODIFIED.
             if (await reopenTopicForConversation(conversationId)) {
@@ -183,7 +196,7 @@ async function handleMessageCreated(event: ChatwootMessageEvent, item: QueuedWeb
                 return;
             }
         }
-        if (errObj?.response?.description?.includes('TOPIC_DELETED') || errObj?.message?.includes('TOPIC_DELETED')) {
+        if (isTelegramRejection(error) && errObj?.response?.description?.includes('TOPIC_DELETED')) {
             if (item.text_sent || item.text_chunk_index || item.attachment_index) {
                 // The old topic contained confirmed parts. Recreating it and
                 // sending only the remainder would lose the visible context.
@@ -228,8 +241,8 @@ async function handleConversationStatusChanged(event: ChatwootConversationStatus
 
 app.get('/health', (_req: Request, res: Response) => {
     try {
-        const queue = webhookQueueHealth();
-        const failed = !!queue.failed || isReconciliationFailed() || queueWorkerHealth.isStalled();
+        const queue = webhookQueueHealth(activeQueueId);
+        const failed = !!queue.failed || !!unresolvedOutgoingCount() || isReconciliationFailed() || queueWorkerHealth.isStalled();
         res.status(failed ? 503 : 200).json({ status: failed ? 'degraded' : 'ok', queue });
     } catch {
         res.status(503).json({ status: 'unavailable' });
@@ -274,6 +287,18 @@ app.post('/webhook', verifySignature, (req: RawBodyRequest, res: Response) => {
         return;
     }
 
+    // A marker is generated and persisted locally before the bridge's POST.
+    // Never trust a claimed marker alone: require signed webhook verification,
+    // the configured dedicated bridge sender, and exact account/conversation.
+    if (eventType === 'message_created' && event?.message_type === 'outgoing' &&
+        config.chatwootWebhookSecret && config.chatwootBridgeUserId && typeof event?.content_attributes?.telegram_bridge_origin_token === 'string' &&
+        Number.isSafeInteger(event?.sender?.id) && event.sender.id === Number(config.chatwootBridgeUserId) &&
+        accountId === Number(config.chatwootAccountId) &&
+        matchesOutgoingSource(event.content_attributes.telegram_bridge_origin_token, accountId, convId, event.sender.id)) {
+        res.sendStatus(200);
+        return;
+    }
+
     log.debug('Webhook received', {
         eventType,
         eventId,
@@ -301,6 +326,7 @@ app.post('/webhook', verifySignature, (req: RawBodyRequest, res: Response) => {
 
 let draining = false;
 let stoppingQueue = false;
+let activeQueueId: number | undefined;
 export class QueueWorkerHealth {
     private startedAt: number | undefined;
     constructor(private readonly now: () => number = () => performance.now()) {}
@@ -321,6 +347,7 @@ export async function drainWebhookQueue(): Promise<void> {
         while (!stoppingQueue) {
             const item = nextQueuedWebhook();
             if (!item) break;
+            activeQueueId = item.id;
             queueWorkerHealth.start();
             try {
                 const event = JSON.parse(item.payload);
@@ -332,10 +359,11 @@ export async function drainWebhookQueue(): Promise<void> {
                 completeQueuedWebhook(item.id);
             } catch {
                 // Do not log the exception: it may contain message bodies or tokens.
-                log.error('Queued webhook delivery failed; will retry', { queueId: item.id, conversationId: item.conversation_id });
+                log.error('Queued webhook delivery failed; retry or manual review required', { queueId: item.id, conversationId: item.conversation_id });
                 retryQueuedWebhook(item.id, item.attempts);
             } finally {
                 queueWorkerHealth.finish();
+                activeQueueId = undefined;
             }
         }
     } catch {

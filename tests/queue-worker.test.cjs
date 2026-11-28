@@ -1,6 +1,8 @@
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const Module = require('node:module');
+const { TelegramError } = require('telegraf');
+const rejected = description => new TelegramError({ok:false,error_code:400,description});
 
 test('legacy mode ignores stale topic mappings and continues to later messages', async () => {
   let statusCalls=0, sent=0;
@@ -24,6 +26,8 @@ test('legacy mode ignores stale topic mappings and continues to later messages',
       closeTopicForConversation:async()=>{statusCalls++; return false;}},
   };
   const modulePath=require.resolve('../dist/server.js'), original=Module._load;
+  mocks['./database'].beginQueuedSend=()=>{};
+  mocks['./database'].clearQueuedSend=()=>{};
   Module._load=function(request,parent){
     if(parent?.filename?.replace(/\\/g,'/').endsWith('dist/server.js') && Object.hasOwn(mocks,request)) return mocks[request];
     return original.apply(this,arguments);
@@ -105,20 +109,20 @@ test('delivery failure retains progress and never resends confirmed steps', asyn
   const logger = {debug(){}, info(){}, warn(){}, error(){}};
   const mocks = {
     './config': {config: {chatwootWebhookSecret:'test', chatwootAccountId:'1', chatwootInboxId:'2', telegramForumChatId:'-100', telegramAdminId:'99'}},
-    './bot-instance': {bot:{telegram:{sendMessage:async () => {if (fail) throw new Error('simulated'); textSends++; return {message_id:11};}}}},
+    './bot-instance': {bot:{telegram:{sendMessage:async () => {if (fail) throw rejected('simulated'); textSends++; return {message_id:11};}}}},
     './database': {
       saveMapping(){}, getTopic: () => ({telegram_topic_id: 42}), enqueueWebhook(){},
       nextQueuedWebhook: () => (!waiting && !completed ? item : undefined),
       completeQueuedWebhook: id => {assert.equal(id, 1); completed = true;},
       markQueuedTextSent: () => { item.text_sent = 1; },
       recordQueuedTextChunkSent: (_id, next) => { item.text_chunk_index = next; },
-      markQueuedAttachmentSent: (_id, next) => { item.attachment_index = next; },
+      beginQueuedSend(){}, clearQueuedSend(){}, recordQueuedAttachmentSent: (_id, next) => { item.attachment_index = next; },
       retryQueuedWebhook: id => {assert.equal(id, 1); retries++; waiting = true;}
     },
     './chatwoot': {isSelfSentMessage:() => false, conversationMutex:{runExclusive:(_key, fn) => fn()}},
     './logger': {createLogger:() => logger},
     './formatters': {renderForwardedMessage:() => 'text', extractContactCard:() => ({name:'test'}), extractSenderName:() => ({name:'test'})},
-    './attachments': {extractAttachments:() => [{id:1}, {id:2}], sendAttachmentToTelegram:async ({att}) => { fileSends.push(att.id); if (failAttachment && att.id === 2) throw new Error('simulated attachment error'); }},
+    './attachments': {extractAttachments:() => [{id:1}, {id:2}], sendAttachmentToTelegram:async ({att,recordSent}) => { fileSends.push(att.id); if (failAttachment && att.id === 2) throw rejected('simulated attachment error'); recordSent(99); }},
     './topics': {getOrCreateTopic:async () => 42, closeTopicForConversation:async () => true, reopenTopicForConversation:async () => true,
       dropTopic(){}, buildForumInlineKeyboard:() => ({}), buildLegacyKeyboard:() => ({})},
   };
@@ -158,10 +162,10 @@ test('closed topic is reopened before retry so its later open status is not bloc
   const logger = {debug(){}, info(){}, warn(){}, error(){}};
   const mocks = {
     './config': {config:{telegramForumChatId:'-100', telegramAdminId:'99'}},
-    './bot-instance': {bot:{telegram:{sendMessage:async (_chat, _text, options) => {assert.equal(options.message_thread_id,42); if (closed) throw new Error('Bad Request: TOPIC_CLOSED'); sent++; return {message_id:11};}}}},
+    './bot-instance': {bot:{telegram:{sendMessage:async (_chat, _text, options) => {assert.equal(options.message_thread_id,42); if (closed) throw rejected('Bad Request: TOPIC_CLOSED'); sent++; return {message_id:11};}}}},
     './database': {saveMapping(){}, getTopic:() => ({telegram_topic_id:42}), nextQueuedWebhook:() => items[0],
       completeQueuedWebhook:id => {assert.equal(items[0].id,id); items.shift();},
-      markQueuedTextSent:() => {}, recordQueuedTextChunkSent:() => {}, markQueuedAttachmentSent:() => {}, retryQueuedWebhook:() => {throw new Error('unexpected retry');}},
+      markQueuedTextSent:() => {}, recordQueuedTextChunkSent:() => {}, beginQueuedSend(){}, clearQueuedSend(){}, retryQueuedWebhook:() => {throw new Error('unexpected retry');}},
     './chatwoot': {isSelfSentMessage:() => false, conversationMutex:{runExclusive:(_key, fn) => fn()}},
     './logger': {createLogger:() => logger},
     './formatters': {renderForwardedMessage:() => 'text', extractContactCard:() => ({name:'test'}), extractSenderName:() => ({name:'test'})},
@@ -203,13 +207,13 @@ test('long Unicode text is split without HTML and resumes after the last confirm
       assert.ok(text.length <= 3000);
       assert.equal(/[\uD800-\uDBFF]$/.test(text),false);
       assert.equal(/^[\uDC00-\uDFFF]/.test(text),false);
-      if (attempts === 2 && failSecond) {failSecond=false; throw new Error('simulated timeout');}
+      if (attempts === 2 && failSecond) {failSecond=false; throw rejected('simulated rejection');}
       successes.push(text);
       return {message_id:attempts};
     }}}},
     './database': {saveMapping(){}, getTopic:() => ({telegram_topic_id:42}), nextQueuedWebhook:() => !waiting && !completed ? item : undefined,
       completeQueuedWebhook:() => {completed=true;}, markQueuedTextSent:() => {item.text_sent=1;},
-      recordQueuedTextChunkSent:(_id,next) => {item.text_chunk_index=next;}, markQueuedAttachmentSent(){},
+      recordQueuedTextChunkSent:(_id,next) => {item.text_chunk_index=next;}, beginQueuedSend(){}, clearQueuedSend(){},
       retryQueuedWebhook:() => {waiting=true;}},
     './chatwoot': {isSelfSentMessage:() => false, conversationMutex:{runExclusive:(_key, fn) => fn()}},
     './logger': {createLogger:() => logger},

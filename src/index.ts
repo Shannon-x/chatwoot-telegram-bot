@@ -4,7 +4,7 @@ import { bot } from './bot';
 import './bot'; // 确保 bot handlers 注册（callback router 在 import 时挂载）
 import { config } from './config';
 import { initDb as initDatabase, closeDb, reconciliationState, advanceReconciliation, enqueueWebhook } from './database';
-import { verifyReconciliationInbox, listChangedConversations, listConversationMessages } from './chatwoot';
+import { verifyReconciliationInbox, listChangedConversations, listConversationMessages, verifyBridgeUser } from './chatwoot';
 import { reconcileOnce, startReconciliationPass, finishReconciliationPass } from './reconciliation';
 import { createLogger, closeLogger } from './logger';
 
@@ -14,6 +14,7 @@ const PORT = config.port;
 async function start() {
     initDatabase();
     log.info('Database initialized');
+    await verifyBridgeUser();
 
     // Recovery is opt-in and requires an explicit first activation boundary.
     let reconciling = false;

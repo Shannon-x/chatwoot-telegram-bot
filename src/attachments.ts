@@ -1,29 +1,14 @@
-import axios from 'axios';
-import http from 'http';
-import https from 'https';
 import { config } from './config';
 import { bot } from './bot-instance';
 import { saveMapping } from './database';
 import { createLogger } from './logger';
 import type { ChatwootAttachment, ChatwootMessageEvent } from './types';
+import { isTelegramRejection, isRejectedFileUrl } from './delivery-safety';
+import { downloadSafeChatwootAttachment } from './safe-download';
 
 const log = createLogger('attachments');
 
 const TELEGRAM_MAX_FILE_SIZE_BYTES = 45 * 1024 * 1024;
-
-const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 50 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50 });
-
-const downloadClient = axios.create({
-    timeout: 20_000,
-    maxRedirects: 5,
-    httpAgent,
-    httpsAgent,
-    headers: { api_access_token: config.chatwootAccessToken },
-    maxContentLength: TELEGRAM_MAX_FILE_SIZE_BYTES + 1024 * 1024,
-    maxBodyLength: TELEGRAM_MAX_FILE_SIZE_BYTES + 1024 * 1024,
-    validateStatus: (s) => s >= 200 && s < 400,
-});
 
 // ============ Helpers ============
 
@@ -68,12 +53,10 @@ async function downloadAttachment(att: ChatwootAttachment): Promise<{ buffer: Bu
         return { buffer: Buffer.alloc(0), filename, size: declaredSize, sourceUrl: url };
     }
 
-    log.debug('Downloading attachment from Chatwoot', { filename, url: url.substring(0, 120) });
-    const resp = await downloadClient.get<ArrayBuffer>(url, { responseType: 'arraybuffer' });
-    const buffer = Buffer.from(resp.data);
-    const mimeTypeHeader = (resp.headers?.['content-type'] as string | undefined) || undefined;
+    const { buffer, mimeType } = await downloadSafeChatwootAttachment(url, config.chatwootBaseUrl, config.chatwootAccessToken,
+        {allowedExternalOrigins: config.attachmentDownloadOrigins});
     log.debug('Attachment downloaded', { filename, sizeBytes: buffer.length });
-    return { buffer, mimeType: mimeTypeHeader || att.content_type, filename, size: buffer.length, sourceUrl: url };
+    return { buffer, mimeType: mimeType || att.content_type, filename, size: buffer.length, sourceUrl: url };
 }
 
 // ============ Send to Telegram ============
@@ -85,8 +68,20 @@ export async function sendAttachmentToTelegram(params: {
     accountId: number;
     chatwootMessageId?: number;
     messageThreadId?: number;
+    recordSent?: (telegramMessageId: number) => void;
+    beginSend?: () => void;
+    clearSend?: () => void;
 }) {
-    const { chatId, att, conversationId, accountId, chatwootMessageId, messageThreadId } = params;
+    const { chatId, att, conversationId, accountId, chatwootMessageId, messageThreadId, recordSent, beginSend, clearSend } = params;
+    const commit = (id: number) => recordSent ? recordSent(id) : saveMapping(id, conversationId, accountId, chatwootMessageId);
+    const send = async (fn: () => Promise<{message_id: number}>) => {
+        beginSend?.();
+        let result: {message_id: number};
+        try { result = await fn(); }
+        catch (error) { if (isTelegramRejection(error)) clearSend?.(); throw error; }
+        commit(result.message_id);
+        return result;
+    };
     const sendOptions: { message_thread_id?: number } = {};
     if (messageThreadId) sendOptions.message_thread_id = messageThreadId;
 
@@ -99,17 +94,21 @@ export async function sendAttachmentToTelegram(params: {
     const directUrl = pickAttachmentUrl(att);
     if (directUrl && !directUrl.startsWith('data:')) {
         const kind = guessTelegramSendKind(att, att.content_type);
+        let sent: { message_id: number } | undefined;
         try {
-            let sent;
-            if (kind === 'photo') sent = await bot.telegram.sendPhoto(chatId, directUrl, sendOptions);
-            else if (kind === 'video') sent = await bot.telegram.sendVideo(chatId, directUrl, sendOptions);
-            else if (kind === 'audio') sent = await bot.telegram.sendAudio(chatId, directUrl, sendOptions);
-            else sent = await bot.telegram.sendDocument(chatId, directUrl, sendOptions);
-            saveMapping(sent.message_id, conversationId, accountId, chatwootMessageId);
+            if (kind === 'photo') sent = await send(() => bot.telegram.sendPhoto(chatId, directUrl, sendOptions));
+            else if (kind === 'video') sent = await send(() => bot.telegram.sendVideo(chatId, directUrl, sendOptions));
+            else if (kind === 'audio') sent = await send(() => bot.telegram.sendAudio(chatId, directUrl, sendOptions));
+            else sent = await send(() => bot.telegram.sendDocument(chatId, directUrl, sendOptions));
+        } catch (error) {
+            // A timeout/network failure may mean Telegram already accepted the
+            // file. Never immediately send another copy on an unknown outcome.
+            if (!isRejectedFileUrl(error)) throw error;
+            log.warn('Direct URL send failed, falling back to download+upload', { filename: att.file_name });
+        }
+        if (sent) {
             log.debug('Attachment sent via direct URL', { filename: att.file_name, kind });
             return;
-        } catch {
-            log.warn('Direct URL send failed, falling back to download+upload', { filename: att.file_name });
         }
     }
 
@@ -117,21 +116,21 @@ export async function sendAttachmentToTelegram(params: {
     try {
         downloaded = await downloadAttachment(att);
     } catch (err) {
-        log.error('Attachment download failed', { filename: att.file_name, error: String(err) });
-        const url = pickAttachmentUrl(att);
-        const sent = await bot.telegram.sendMessage(chatId, `📎 附件下载失败：${att.file_name || att.id || ''}\n${url ? `链接：${url}` : ''}`, sendOptions);
-        saveMapping(sent.message_id, conversationId, accountId, chatwootMessageId);
-        return;
+        // No Telegram side effect has occurred for this attempt. Keep the
+        // file pending rather than acknowledging a link as a delivered file.
+        if (err instanceof Error && /Untrusted attachment URL|Invalid object storage origin/.test(err.message)) {
+            log.error('Attachment origin rejected; configure ATTACHMENT_DOWNLOAD_ORIGINS for trusted HTTPS object storage');
+        } else log.error('Attachment download failed; retained for retry');
+        throw err;
     }
 
     if (downloaded.size > TELEGRAM_MAX_FILE_SIZE_BYTES || downloaded.buffer.length === 0) {
         const url = downloaded.sourceUrl || pickAttachmentUrl(att);
-        const sent = await bot.telegram.sendMessage(
+        await send(() => bot.telegram.sendMessage(
             chatId,
             `📎 附件过大（${Math.ceil(downloaded.size / 1024 / 1024)}MB）\n文件：${downloaded.filename}\n${url ? `下载链接：${url}` : ''}`,
             sendOptions,
-        );
-        saveMapping(sent.message_id, conversationId, accountId, chatwootMessageId);
+        ));
         log.warn('Attachment too large for Telegram', { filename: downloaded.filename, sizeMB: Math.ceil(downloaded.size / 1024 / 1024) });
         return;
     }
@@ -139,20 +138,19 @@ export async function sendAttachmentToTelegram(params: {
     const kind = guessTelegramSendKind(att, downloaded.mimeType);
     const inputFile = { source: downloaded.buffer, filename: downloaded.filename };
 
+    let sent: { message_id: number } | undefined;
     try {
-        let sent;
-        if (kind === 'photo') sent = await bot.telegram.sendPhoto(chatId, inputFile, sendOptions);
-        else if (kind === 'video') sent = await bot.telegram.sendVideo(chatId, inputFile, sendOptions);
-        else if (kind === 'audio') sent = await bot.telegram.sendAudio(chatId, inputFile, sendOptions);
-        else sent = await bot.telegram.sendDocument(chatId, inputFile, sendOptions);
-        saveMapping(sent.message_id, conversationId, accountId, chatwootMessageId);
-        log.debug('Attachment sent via download+upload', { filename: downloaded.filename, kind });
+        if (kind === 'photo') sent = await send(() => bot.telegram.sendPhoto(chatId, inputFile, sendOptions));
+        else if (kind === 'video') sent = await send(() => bot.telegram.sendVideo(chatId, inputFile, sendOptions));
+        else if (kind === 'audio') sent = await send(() => bot.telegram.sendAudio(chatId, inputFile, sendOptions));
+        else sent = await send(() => bot.telegram.sendDocument(chatId, inputFile, sendOptions));
     } catch (err) {
-        log.error('Attachment send to Telegram failed', { filename: downloaded.filename, error: String(err) });
+        if (!isTelegramRejection(err) || (err as { response?: { error_code?: number } }).response?.error_code !== 400) throw err;
+        log.error('Attachment send to Telegram was rejected');
         const url = downloaded.sourceUrl || pickAttachmentUrl(att);
-        const sent = await bot.telegram.sendMessage(chatId, `📎 附件发送失败：${downloaded.filename}\n${url ? `链接：${url}` : ''}`, sendOptions);
-        saveMapping(sent.message_id, conversationId, accountId, chatwootMessageId);
+        sent = await send(() => bot.telegram.sendMessage(chatId, `📎 附件发送失败：${downloaded.filename}\n${url ? `链接：${url}` : ''}`, sendOptions));
     }
+    log.debug('Attachment sent via download+upload', { filename: downloaded.filename, kind });
 }
 
 /**

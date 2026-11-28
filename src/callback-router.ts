@@ -7,6 +7,7 @@ import { getMapping, getTopic } from './database';
 import {
     toggleConversationStatus,
     createMessage,
+    UnknownChatwootSend,
     toggleTypingStatus,
     getCannedResponses,
     getContact,
@@ -73,7 +74,7 @@ addRoute('canned:', async (ctx, parts) => {
             return;
         }
         void toggleTypingStatus(conversationId, 'on');
-        await createMessage(conversationId, selected.content);
+        await createMessage(conversationId, selected.content, {chatId: String(ctx.chat?.id ?? 'callback'), eventId: `callback:${ctx.callbackQuery.id}`});
         await ctx.answerCbQuery(`✅ 已发送: ${selected.short_code}`);
         try {
             const truncated = selected.content.substring(0, 200) + (selected.content.length > 200 ? '...' : '');
@@ -83,7 +84,7 @@ addRoute('canned:', async (ctx, parts) => {
         } catch { /* may be too old */ }
     } catch (err) {
         log.error('Failed to send canned response', { responseId, conversationId, ...extractAxiosError(err) });
-        await ctx.answerCbQuery('❌ 发送失败，请重试');
+        await ctx.answerCbQuery(err instanceof UnknownChatwootSend ? '⚠️ 发送结果未知，请先检查对话' : '❌ 发送失败，请检查对话');
     }
 });
 

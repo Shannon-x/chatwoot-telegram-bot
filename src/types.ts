@@ -96,6 +96,7 @@ export interface ChatwootAttachment {
 }
 
 export interface ChatwootMessageEvent {
+    source_id?: string;
     event: 'message_created';
     id?: number;
     content?: string;

@@ -8,7 +8,8 @@
     "build": "tsc",
     "dev": "nodemon src/index.ts",
     "test": "vitest run src",
-    "test:recovery": "npm run build && node --test tests/reconciliation.test.cjs tests/durable-queue.test.cjs tests/reconciliation-migration.test.cjs tests/queue-worker.test.cjs tests/webhook.test.cjs tests/topic-status.test.cjs",
+    "test:recovery": "npm run build && node --test tests/reconciliation.test.cjs tests/durable-queue.test.cjs tests/reconciliation-migration.test.cjs tests/queue-worker.test.cjs tests/webhook.test.cjs tests/topic-status.test.cjs tests/resolve-recovery.test.cjs tests/attachment-safety.test.cjs tests/safe-download.test.cjs",
+    "test:e2e": "npm run build && node tests/e2e/local-e2e.cjs basic && node tests/e2e/local-e2e.cjs crash && node tests/e2e/local-e2e.cjs unknown",
     "test:watch": "vitest"
   },
   "keywords": [],

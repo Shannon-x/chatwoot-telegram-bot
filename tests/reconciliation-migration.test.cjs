@@ -76,7 +76,7 @@ test('v5 migration requires captured pre-upgrade boundary and keeps it across re
     store=require(dbModule); store.initDb();
     store.enqueueWebhook('message:1:10',7,'{"event":"message_created"}');
     store.closeDb(); store=null; delete require.cache[dbModule];
-    const old=new Database(dbPath); old.exec('DROP TABLE reconciliation_state; UPDATE schema_version SET version=5'); old.close();
+    const old=new Database(dbPath); old.exec('DROP TABLE reconciliation_state; DROP TABLE bridge_outgoing_sources; ALTER TABLE webhook_queue DROP COLUMN inflight; UPDATE schema_version SET version=5'); old.close();
     delete process.env.RECONCILIATION_BASELINE_UNIX;
     store=require(dbModule); store.initDb();
     assert.throws(()=>store.reconciliationState(2000, 1, 2),/required/);

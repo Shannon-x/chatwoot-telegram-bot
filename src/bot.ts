@@ -6,6 +6,7 @@ import { getMapping, getTopicByTopicId } from './database';
 import {
     createMessage,
     createMessageWithAttachment,
+    UnknownChatwootSend,
     toggleTypingStatus,
     getCannedResponses,
 } from './chatwoot';
@@ -137,17 +138,17 @@ bot.on('text', async (ctx) => {
     log.debug('Processing user text message', {
         conversationId,
         fromForum: isFromForum(ctx),
-        textPreview: msg.text.substring(0, 80),
     });
 
     try {
         void toggleTypingStatus(conversationId, 'on');
-        await createMessage(conversationId, msg.text);
+        await createMessage(conversationId, msg.text, {chatId: String(ctx.chat.id), eventId: `message:${msg.message_id}`});
         await reactSuccess(ctx, msg);
         log.info('Message sent to Chatwoot', { conversationId });
     } catch (error) {
         log.error('Failed to send message to Chatwoot', { conversationId, ...extractAxiosError(error) });
-        await reactFailure(ctx, msg, '❌ 发送消息到 Chatwoot 失败，请查看日志。');
+        if (error instanceof UnknownChatwootSend) await ctx.reply('⚠️ 发送结果未知。请先检查 Chatwoot 对话，再决定是否重试。');
+        else await reactFailure(ctx, msg, '❌ 发送消息到 Chatwoot 失败，请查看日志。');
     }
 });
 
@@ -201,12 +202,13 @@ async function handleMediaMessage(
             buffer,
             filename: finalFilename,
             mimeType,
-        });
+        }, {chatId: String(ctx.chat!.id), eventId: `message:${msg.message_id}`});
         await reactSuccess(ctx, msg);
         log.info('Attachment sent to Chatwoot', { conversationId, filename: finalFilename });
     } catch (error) {
         log.error('Failed to send attachment to Chatwoot', { conversationId, filename, ...extractAxiosError(error) });
-        await reactFailure(ctx, msg, '❌ 发送附件到 Chatwoot 失败，请查看日志。');
+        if (error instanceof UnknownChatwootSend) await ctx.reply('⚠️ 发送结果未知。请先检查 Chatwoot 对话，再决定是否重试。');
+        else await reactFailure(ctx, msg, '❌ 发送附件到 Chatwoot 失败，请查看日志。');
     }
 }
 
